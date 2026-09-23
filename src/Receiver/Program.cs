@@ -4,7 +4,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using Azure.Storage.Queues;
 
-// Mini-Nils receiver.
+// Mini-bug receiver.
 //
 // Receives GitHub webhooks, verifies the signature, and queues a message when
 // an issue receives the agent label or somebody mentions the agent on a PR.
@@ -27,7 +27,7 @@ var queue = new QueueClient(queueConnection, queueName);
 await queue.CreateIfNotExistsAsync();
 
 app.MapGet("/", () =>
-    $"Mini-Nils receiver. Listening for the «{agentLabel}» label" +
+    $"Mini-bug receiver. Listening for the «{agentLabel}» label" +
     (agentMention.Length > 0 ? $" and @{agentMention} mentions." : "."));
 
 app.MapPost("/webhook", async (HttpRequest request) =>
