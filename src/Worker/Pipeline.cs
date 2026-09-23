@@ -68,8 +68,6 @@ internal sealed class Pipeline(AgentConfig config, string agentDir, string works
         bool skipReservation,
         List<StageRun> runs)
     {
-        // TODO 0: Remove this placeholder (the Log.Error line and "return 2" at the bottom).
-        Log.Error("Lab 1-skallet er ikke implementert ennå. Følg docs/lab1.md og implementer RunStages før du kjører agenten.");
         // Each TODO matches a step in docs/lab1.md, "Slik gjør du det i RunStages".
         // TODO 1: Reserve the task unless skipReservation is set. (lab1.md, step 1)
         // TODO 2: Clone the repository and create a branch. (step 2)
@@ -80,8 +78,106 @@ internal sealed class Pipeline(AgentConfig config, string agentDir, string works
         // TODO 6: Run build and test as a deterministic gate. (step 6)
         // TODO 7: Commit, push, and create a pull request. No auto-merge. (step 7)
 
-        await Task.CompletedTask;
-        return 2;
+        if (skipReservation)
+        {
+            Log.Info("Hopper over issue-statussjekken etter --skip-reservation.");
+        }
+        else
+        {
+            var busy = await Reservation.IsBusy(task, AgentName);
+            if (busy is not null)
+            {
+                await Comment(task, $"Lar denne issuen ligge: {busy}.");
+                return 0;
+            }
+
+            await Reservation.Claim(task);
+        }
+
+        var repo = await Repository.Clone(task.Repo, workspace);
+        await repo.CreateBranch(task.BranchName);
+        Log.Info($"Branch: {task.BranchName}");
+        await Comment(task, StartMarker(task));
+
+        InstallSkills();
+        var memory = await ReadMemory();
+        var systemPrompt = BuildSystemPrompt(memory);
+        var previousOutput = "";
+
+        foreach (var stage in config.Stages)
+        {
+            var model = stage.Model ?? config.Model;
+            var prompt = BuildPrompt(stage, task, previousOutput);
+            var result = await ClaudeRunner.Run(stage, model, prompt, systemPrompt, repo.Path);
+            runs.Add(new StageRun(stage.Name, model, result));
+            LogUsage(stage.Name, model, result);
+
+            if (!result.Ok || string.IsNullOrWhiteSpace(result.Text))
+            {
+                var outcome = $"stage {stage.Name} feilet";
+                await Comment(
+                    task,
+                    $"{Fence(result.Text, 2000)}\n\n" +
+                    $"{UsageTable(runs)}\n" +
+                    $"{EndMarker(task, outcome, pr: false, runs)}");
+                return 1;
+            }
+
+            if (stage.Name == "plan-review" &&
+                !result.Text.StartsWith("PLAN GODKJENT", StringComparison.Ordinal))
+            {
+                await Comment(
+                    task,
+                    $"{Fence(result.Text, 2000)}\n\n" +
+                    $"{UsageTable(runs)}\n" +
+                    $"{EndMarker(task, "plan ikke godkjent", pr: false, runs)}");
+                await Remember(task, "stoppet, plan ikke godkjent", runs);
+                return 1;
+            }
+
+            previousOutput = result.Text;
+        }
+
+        if (!await repo.HasChanges())
+        {
+            await Comment(
+                task,
+                $"{Fence(previousOutput, 2000)}\n\n" +
+                $"{UsageTable(runs)}\n" +
+                $"{EndMarker(task, "ingen endring", pr: false, runs)}");
+            await Remember(task, "ingen kodeendring", runs);
+            return 0;
+        }
+
+        var (verified, verifyLog) = await Verify(repo.Path);
+        if (!verified && config.StopOnVerifyFailure)
+        {
+            Log.Error("Verifisering feilet og stopOnVerifyFailure er satt.");
+            await Comment(
+                task,
+                $"{Fence(verifyLog, 2000)}\n\n" +
+                $"{UsageTable(runs)}\n" +
+                $"{EndMarker(task, "rødt bygg", pr: false, runs)}");
+            await Remember(task, "stoppet, rødt bygg", runs);
+            return 2;
+        }
+
+        if (!verified)
+        {
+            Log.Info("Verifisering feilet, men stopOnVerifyFailure er false. Fortsetter til levering.");
+        }
+
+        await repo.CommitAndPush(task.BranchName, task.Title);
+        var prBody = PrBody(task, previousOutput, verified, verifyLog, runs);
+        var prUrl = await repo.CreatePullRequest(task.BranchName, task.Title, prBody, draft: !verified);
+        await Comment(
+            task,
+            $"PR: {prUrl}\n\n" +
+            $"{UsageTable(runs)}\n" +
+            $"{EndMarker(task, verified ? "levert" : "levert som utkast", pr: true, runs)}");
+        WriteSummary(task, prUrl, verified, runs);
+        await Remember(task, verified ? "levert PR" : "levert utkast", runs);
+        return 0;
     }
     // ASSEMBLY_END
 
